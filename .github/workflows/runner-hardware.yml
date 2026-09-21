@@ -1,0 +1,142 @@
+name: macOS runner hardware
+
+# What silicon is actually behind each macOS runner label? Collect it on every
+# PR and on demand. Output goes to the job summary always, and to an upserted
+# PR comment when the PR comes from a branch in this repo.
+#
+# This uses `pull_request`, not `pull_request_target`: the collect jobs run the
+# PR's own code with a read-only token and no secrets. Only the `report` job
+# holds `pull-requests: write`, and it never checks out or executes PR code.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: runner-hardware-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  collect:
+    strategy:
+      # xcode-27 is a preview image and may be unavailable; a failure there must
+      # not hide the macos-latest result.
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-latest
+          - xcode-27
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Collect hardware info
+        env:
+          LABEL: ${{ matrix.runner }}
+        run: ./scripts/macos-hardware.sh out "$LABEL"
+
+      - name: Add to job summary
+        env:
+          LABEL: ${{ matrix.runner }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### \`$LABEL\`"
+            echo
+            echo '| Runner | Chip | Cores | P+E | Memory | Arch | macOS | hw.model | hw.cpufamily | Image |'
+            echo '|---|---|---|---|---|---|---|---|---|---|'
+            cat "out/row-$LABEL.md"
+            echo
+            cat "out/details-$LABEL.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload fragments
+        uses: actions/upload-artifact@v7
+        with:
+          name: hw-${{ matrix.runner }}
+          path: out/
+          retention-days: 7
+
+  report:
+    needs: collect
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download fragments
+        uses: actions/download-artifact@v8
+        with:
+          pattern: hw-*
+          merge-multiple: true
+          path: hw
+
+      - name: Assemble report
+        env:
+          COLLECT_RESULT: ${{ needs.collect.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rows=(hw/row-*.md)
+          details=(hw/details-*.md)
+          {
+            echo '<!-- macos-runner-hardware -->'
+            echo '### macOS runner hardware'
+            echo
+            if [ ${#rows[@]} -eq 0 ]; then
+              echo 'No runner reported any data.'
+            else
+              echo '| Runner | Chip | Cores | P+E | Memory | Arch | macOS | hw.model | hw.cpufamily | Image |'
+              echo '|---|---|---|---|---|---|---|---|---|---|'
+              cat "${rows[@]}"
+            fi
+            if [ "$COLLECT_RESULT" != "success" ]; then
+              echo
+              echo "> [!WARNING]"
+              echo "> At least one collect job did not succeed (\`$COLLECT_RESULT\`); runners missing from the table have no data."
+            fi
+            echo
+            for f in "${details[@]}"; do
+              cat "$f"
+              echo
+            done
+            echo "<sub><a href=\"$RUN_URL\">run</a> · $(date -u '+%Y-%m-%d %H:%M UTC')</sub>"
+          } > body.md
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Skipped for fork and Dependabot PRs, which only get a read-only token.
+      # Their results are still in the job summary.
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- macos-runner-hardware -->';
+            const body = fs.readFileSync('body.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find(
+              (comment) =>
+                comment.user?.login === 'github-actions[bot]' &&
+                comment.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
